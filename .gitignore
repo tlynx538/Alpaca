@@ -1,6 +1,6 @@
 .DS_Store
 visual_models/
-env/
-src/__pycache__/
-src/internal/__pycache__/
-.env
+api/env/
+api/src/__pycache__/
+api/src/internal/__pycache__/
+api/.env
