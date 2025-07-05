@@ -1,0 +1,56 @@
+from fastapi import APIRouter
+from internal.kernel import KernelManagerInterface
+from pydantic import BaseModel
+
+router = APIRouter()
+
+kernel_manager = None 
+
+class CodeRequest(BaseModel):
+    code: str
+
+@router.get("/kernel/start")
+async def start_kernel(kernel_name: str = 'python3'):
+    """
+    Starts a Jupyter kernel with the specified name.
+    Default is 'python3'.
+    """
+    global kernel_manager
+    try:
+        kernel_manager = KernelManagerInterface()
+        return {"status": "Kernel started successfully", "kernel_name": kernel_name}
+    except Exception as e:
+        return {"status": "Error", "message": str(e)}
+
+@router.post("/kernel/execute")
+async def execute_code(request: CodeRequest):
+    """
+    Executes the provided code in the Jupyter kernel.
+    """
+    try:
+        output = kernel_manager.execute_code(request.code)
+        return {"status": "Code executed successfully", "output": output}
+    except Exception as e:
+        return {"status": "Error", "message": str(e)}
+    
+@router.get("/kernel/info")
+async def get_kernel_info():
+    """
+    Returns information about the current Jupyter kernel.
+    """
+    try:
+        info = kernel_manager.get_kernel_info()
+        return {"status": "Kernel info retrieved successfully", "info": info}
+    except Exception as e:
+        return {"status": "Error", "message": str(e)}
+
+@router.post("/kernel/shutdown")
+async def shutdown_kernel():
+    """
+    Shuts down the Jupyter kernel.
+    """
+    try:
+        kernel_manager.shutdown_kernel()
+        return {"status": "Kernel shut down successfully"}
+    except Exception as e:
+        return {"status": "Error", "message": str(e)}
