@@ -13,7 +13,7 @@ The Main Goal of this API is to run python code via REST API.
 - Streaming Output of Code Blocks
 
 ## Other Notes
-- In src/internal/kernel.py we are currently using **jupyter_client.manager.KernelManager** to invoke the instance, we might consider getting into **provisioning** in future.
+- In src/internal/kernel.py we are currently using `jupyter_client.manager.KernelManager` to invoke the instance, we might consider getting into `provisioning` in future.
 - Involving Security of running unsafe code
 
 
@@ -21,10 +21,11 @@ The Main Goal of this API is to run python code via REST API.
 | Method | Path                        | Description                                 |
 |--------|-----------------------------|---------------------------------------------|
 | GET    | /api/kernel/start               | Start a Jupyter kernel                      |
+| GET    | /api/kernel/restart             | Restarts Jupyter kernel                     |
 | POST   | /api/kernel/execute             | Execute code in the kernel                  |
 | GET    | /api/kernel/info                | Get info about the current kernel           |
 | POST   | /api/kernel/shutdown            | Shutdown the kernel                         |
 | POST   | /api/kernel/execute/complete    | Check if code is complete (code completeness check) |
 
 ### Run the FastAPI server
-uvicorn main:app --reload
+`fastapi dev main.py`
