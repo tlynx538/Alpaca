@@ -1,13 +1,10 @@
 from fastapi import FastAPI
 from internal.router import router
 from fastapi.middleware.cors import CORSMiddleware
-
+from internal.middleware import debug_middleware
 
 origins = [
-    "http://localhost:3000",
     "*",
-    "http://192.168.0.131:3000"
-
 ]
 
 app = FastAPI()
@@ -24,4 +21,5 @@ app.add_middleware(
 def home():
     return {"message": "This is Alpaca API. Use the endpoints to interact with the Jupyter kernel."}
 
+app.middleware('http')(debug_middleware)
 app.include_router(router, prefix="/api", tags=["kernel"])
