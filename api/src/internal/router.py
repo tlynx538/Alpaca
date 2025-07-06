@@ -1,16 +1,12 @@
 from fastapi import APIRouter
-from internal.kernel import KernelManagerInterface
-from pydantic import BaseModel
+from internal.kernel import KernelWrapper
+from fastapi.responses import StreamingResponse
+from internal.models import CodeRequest, CodeCompleteRequest
 
 router = APIRouter()
 
 kernel_manager = None 
 
-class CodeRequest(BaseModel):
-    code: str
-
-class CodeCompleteRequest(BaseModel):
-    msg_id: str
 
 @router.get("/kernel/start")
 async def start_kernel(kernel_name: str = 'python3'):
@@ -20,21 +16,29 @@ async def start_kernel(kernel_name: str = 'python3'):
     """
     global kernel_manager
     try:
-        kernel_manager = KernelManagerInterface()
+        kernel_manager = KernelWrapper()
         return {"status": "Kernel started successfully", "kernel_name": kernel_name}
+    except Exception as e:
+        return {"status": "Error", "message": str(e)}
+
+@router.get("/kernel/restart")
+async def restart_kernel():
+    """
+    Restarts the Jupyter kernel.
+    """
+    try:
+        kernel_manager.restart_kernel()
+        return {"status": "Kernel restarted successfully"}
     except Exception as e:
         return {"status": "Error", "message": str(e)}
 
 @router.post("/kernel/execute")
 async def execute_code(request: CodeRequest):
-    """
-    Executes the provided code in the Jupyter kernel.
-    """
-    try:
-        output = kernel_manager.execute_code(request.code)
-        return {"status": "Code executed successfully", "output": output}
-    except Exception as e:
-        return {"status": "Error", "message": str(e)}
+    result = kernel_manager.execute_code(request.code)
+    if isinstance(result, StreamingResponse):
+        return result
+    return {"status": "error", "message": result[0]}  # plain error response
+
     
 @router.get("/kernel/info")
 async def get_kernel_info():
