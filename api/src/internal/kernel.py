@@ -9,6 +9,7 @@ import threading
 import logging
 import gc
 import weakref
+import re 
 from collections import defaultdict
 from dataclasses import dataclass, field
 from enum import Enum
@@ -353,41 +354,48 @@ class KernelWrapper:
     
     def execute_code(self, code: str, timeout: int = 30):
         """Enhanced execute_code with better safety checks"""
+        # Input validation
+        if not code or not isinstance(code, str):
+            raise ValueError("Invalid code input")
+
         # Check kernel health first
         if not self.is_kernel_alive():
             logger.error("Kernel is not alive")
-            return ["Kernel is not running. Please restart the kernel."]
+            raise RuntimeError("Kernel is not running. Please restart the kernel.")
         
-        # Check if restart is in progress
-        if self._restart_in_progress.is_set():
-            return ["Kernel restart in progress. Please wait."]
-        
+        # Skip completeness check for empty/whitespace code
+        if not code.strip():
+            raise ValueError("Empty code cannot be executed")
+
         # Thread-safe execution capacity check
         with self.execution_lock:
             active_count = sum(1 for exec_info in self.executions.values() 
-                             if exec_info.state == ExecutionState.BUSY)
+                        if exec_info.state == ExecutionState.BUSY)
             
             if active_count >= 3:
                 logger.warning(f"Too many concurrent executions: {active_count}")
-                return ["Too many concurrent executions. Please wait."]
+                raise RuntimeError("Too many concurrent executions. Please wait.")
         
-        # Code completeness check (skip for long-running code)
-        with self.execution_lock:
-            if not self.is_long_running(code):
-                try:
-                    with self.kernel_lock:
-                        reply = self.client.is_complete(code)
-                    
-                    if not reply or 'status' not in reply:
-                        logger.warning("Invalid reply from is_complete check")
-                        return ["Failed to check code completeness"]
-                    
-                    if reply['status'] != 'complete':
-                        return [f"Incomplete code: {reply.get('indent', 'Missing closing brackets/parentheses')}"]
+        # Modified completeness check - skip for simple statements
+        if not self.is_long_running(code) and not self.is_simple_statement(code):
+            try:
+                with self.kernel_lock:
+                    # Add timeout for is_complete check
+                    self.client.shell_channel.send_control('is_complete_request', {
+                        'code': code
+                    })
+                    reply = self.client.shell_channel.get_msg(timeout=2.0)
                 
-                except Exception as e:
-                    logger.warning(f"Code completeness check failed: {e}")
-                    return [f"Error checking code completeness: {str(e)}"]
+                if not reply or reply.get('content', {}).get('status') != 'complete':
+                    indent = reply.get('content', {}).get('indent', '')
+                    raise RuntimeError(f"Incomplete code: {indent or 'Missing closing brackets/parentheses'}")
+            
+            except queue.Empty:
+                logger.warning("Timeout checking code completeness - proceeding with execution")
+            except Exception as e:
+                logger.warning(f"Code completeness check failed: {e}")
+                # Instead of failing, we'll proceed with execution and let the kernel handle it
+                pass
         
         try:
             # Execute the code
@@ -419,8 +427,19 @@ class KernelWrapper:
             
         except Exception as e:
             logger.error(f"Failed to execute code: {e}", exc_info=True)
-            return [f"Failed to execute code: {e}"]
-    
+            raise RuntimeError(f"Failed to execute code: {e}")
+
+    def is_simple_statement(self, code: str) -> bool:
+        """Check if code is a simple statement that doesn't need completeness check"""
+        simple_patterns = [
+            r'^\s*print\(.*\)\s*$',
+            r'^\s*[\w]+\s*=\s*.+\s*$',
+            r'^\s*[\w]+\s*$',
+            r'^\s*import\s+.+\s*$',
+            r'^\s*from\s+.+\s*import\s+.+\s*$'
+        ]
+        return any(re.match(pattern, code) for pattern in simple_patterns)
+
     async def _stream_output(self, msg_id: str, timeout: int) -> AsyncGenerator[str, None]:
         start_time = time.time()
         message_count = 0
