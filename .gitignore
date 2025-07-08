@@ -3,5 +3,6 @@ visual_models/
 api/env/
 api/src/__pycache__/
 api/src/internal/__pycache__/
+api/src/kernel/__pycache__/
 api/.env
 api/src/internal/tests/__pycache__/
