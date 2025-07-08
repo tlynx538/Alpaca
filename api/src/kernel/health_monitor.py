@@ -22,6 +22,7 @@ class KernelHealthMonitor:
         self._kernel_healthy = False
         self._shutdown_event = threading.Event()
         self._restart_in_progress = threading.Event()
+        self._monitor_thread: Optional[threading.Thread] = None
 
     def start_monitoring(self):
         """Start the health monitoring thread."""
@@ -75,4 +76,47 @@ class KernelHealthMonitor:
     def is_restart_in_progress(self) -> bool:
         """Check if a kernel restart is currently in progress."""
         return self._restart_in_progress.is_set()
+
+    def _monitor_loop(self):
+        """The main loop for the monitoring thread."""
+        logger.info("Kernel health monitor thread started.")
+        while not self._shutdown_event.is_set():
+            try:
+                status = self.kernel_manager.is_kernel_alive()
+                with self._lock:
+                    self._is_healthy = status
+                    self._last_check_time = time.time()
+                if not status:
+                    logger.warning("Health check failed: Kernel is not alive.")
+            except Exception as e:
+                logger.error(f"Error during health check: {e}")
+                with self._lock:
+                    self._is_healthy = False
+            
+            self._shutdown_event.wait(self.check_interval)
+        
+        logger.info("Kernel health monitor thread has stopped.")
+    
+    def stop_monitoring(self):
+        """
+        Signals the monitoring thread to stop and waits for it to terminate.
+        """
+        if self._monitor_thread and self._monitor_thread.is_alive():
+            logger.info("Stopping kernel health monitor...")
+            
+            # 1. Signal the thread to exit its loop
+            self._shutdown_event.set()
+            
+            # 2. Wait for the thread to finish cleanly (with a timeout)
+            self._monitor_thread.join(timeout=5)
+            
+            if self._monitor_thread.is_alive():
+                logger.warning("Health monitor thread did not stop in time.")
+            else:
+                logger.info("Health monitor stopped successfully.")
+        
+        self._monitor_thread = None
+
+
+
     

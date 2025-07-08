@@ -158,3 +158,59 @@ class KernelWrapper:
                 'restart_in_progress': self.health_monitor.is_restart_in_progress(),
                 'last_kernel_check': self.health_monitor.get_last_check_time()
             }
+        
+    def perform_restart(self, lock: threading.Lock):
+        """
+        A synchronous, blocking method designed to be run in a background thread.
+        This safely handles the entire kernel restart lifecycle.
+        """
+        logger.info("Background kernel restart process has started.")
+        try:
+            # --- 1. Gracefully stop background monitoring ---
+            logger.info("Stopping health monitor and background threads for restart.")
+            if hasattr(self, '_shutdown_event'):
+                self._shutdown_event.set()
+            if hasattr(self, 'health_monitor'):
+                self.health_monitor.stop_monitoring()
+            if hasattr(self, '_cleanup_thread') and self._cleanup_thread.is_alive():
+                self._cleanup_thread.join(timeout=5)
+
+            # --- 2. Shut down the old kernel manager ---
+            logger.info("Shutting down the current kernel manager instance.")
+            if self.kernel_manager and self.kernel_manager.is_kernel_alive():
+                self.kernel_manager.shutdown_kernel()
+
+            # --- 3. Create and start a new kernel instance ---
+            logger.info("Creating and starting a new kernel manager instance.")
+            new_kernel_manager = Kernel(kernel_name=self.kernel_manager.kernel_name)
+            new_kernel_manager.start_kernel()  # This is the blocking part
+
+            if not new_kernel_manager.is_kernel_alive():
+                raise RuntimeError("The new kernel failed to start during restart.")
+
+            # --- 4. Re-initialize the wrapper with the new kernel ---
+            logger.info("Re-initializing wrapper components with the new kernel.")
+            self.kernel_manager = new_kernel_manager
+            
+            # Re-create and re-assign components that depend on the kernel manager
+            self.package_installer = PackageInstaller(kernel_manager=self.kernel_manager)
+            self.code_executor.kernel_manager = self.kernel_manager # Update existing instance
+
+            # --- 5. Restart background services ---
+            logger.info("Restarting health monitor and background threads.")
+            self._shutdown_event.clear()  # Reset the event for new threads
+            self.health_monitor = KernelHealthMonitor(
+                kernel_manager=self.kernel_manager,
+                shutdown_event=self._shutdown_event
+            )
+            self._start_background_tasks() # This will create and start new threads
+
+            logger.info("Kernel restart completed successfully.")
+
+        except Exception as e:
+            logger.critical(f"A critical error occurred during kernel restart: {e}", exc_info=True)
+            # You may want to implement a 'failed' state here to prevent further use
+        finally:
+            # --- 6. ALWAYS release the lock ---
+            lock.release()
+            logger.info("Restart lock has been released.")

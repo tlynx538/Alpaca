@@ -7,7 +7,7 @@ from typing import Optional, Dict, Any, Union, List
 import logging
 import time
 import asyncio
-
+import threading 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -22,6 +22,7 @@ kernel_stats = {
     "failed_executions": 0,
     "restarts": 0
 }
+restart_lock = threading.Lock()
 
 # Helper functions
 def get_kernel_wrapper() -> KernelWrapper:
@@ -72,28 +73,36 @@ async def background_kernel_cleanup():
         except Exception as e:
             logger.error(f"Background cleanup failed: {e}")
 
-# Routes
-@router.get("/kernel/start")
-async def start_kernel(
-    kernel_name: str = 'python3',
-    background_tasks: BackgroundTasks = BackgroundTasks()
-):
-    """Start a new kernel instance"""
-    global kernel_wrapper, kernel_stats
+async def background_start_kernel_with_timeout(wrapper: KernelWrapper, timeout: int):
+    """Enhanced version with proper timeout and state management"""
+    global kernel_wrapper, kernel_stats  # Declare globals at the start
     
     try:
-        # Check if kernel is already running
-        if kernel_wrapper is not None and kernel_wrapper.kernel_manager.is_kernel_alive():
-            return create_success_response(
-                "Kernel is already running",
-                {
-                    "kernel_name": kernel_name,
-                    "stats": kernel_wrapper.get_stats()
-                }
-            )
+        logger.info("Starting kernel with timeout protection")
         
-        # Start new kernel wrapper
-        kernel_wrapper = KernelWrapper(kernel_name=kernel_name)
+        # Run synchronous start in executor with timeout
+        await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, 
+                wrapper.kernel_manager.start_kernel
+            ),
+            timeout=timeout
+        )
+
+        # Verify kernel is truly alive
+        if not wrapper.kernel_manager.is_kernel_alive():
+            raise RuntimeError("Kernel failed to become alive after start")
+
+        # Initialize channels and verify
+        await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None,
+                wrapper.kernel_manager.ensure_channels_active
+            ),
+            timeout=5
+        )
+
+        # Update global state
         kernel_stats.update({
             "started_at": time.time(),
             "total_executions": 0,
@@ -101,20 +110,105 @@ async def start_kernel(
             "restarts": 0
         })
         
-        # Schedule background cleanup
-        background_tasks.add_task(background_kernel_cleanup)
+        logger.info(f"Kernel started successfully with PID: {wrapper.kernel_manager.get_kernel_pid()}")
+        
+    except asyncio.TimeoutError:
+        logger.error("Kernel startup timed out")
+        try:
+            wrapper.kernel_manager.shutdown_kernel()
+        except Exception as e:
+            logger.error(f"Failed to shutdown timed out kernel: {e}")
+        finally:
+            kernel_wrapper = None
+        raise
+    except Exception as e:
+        logger.error(f"Kernel startup failed: {e}")
+        try:
+            wrapper.kernel_manager.shutdown_kernel()
+        except Exception as cleanup_error:
+            logger.error(f"Cleanup failed: {cleanup_error}")
+        finally:
+            kernel_wrapper = None
+        raise
+
+async def monitor_kernel_health():
+    """Background task to monitor kernel health"""
+    global kernel_wrapper
+    while True:
+        await asyncio.sleep(5)  # Check every 5 seconds
+        if kernel_wrapper is None:
+            continue
+            
+        try:
+            if not kernel_wrapper.kernel_manager.is_kernel_alive():
+                logger.warning("Kernel appears to have died")
+                try:
+                    kernel_wrapper.kernel_manager.cleanup()
+                except Exception as e:
+                    logger.error(f"Cleanup of dead kernel failed: {e}")
+                finally:
+                    kernel_wrapper = None
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+
+@router.post("/kernel/start")
+async def start_kernel(kernel_name: str = 'python3'):
+    global kernel_wrapper, kernel_stats
+    
+    if kernel_wrapper is not None:
+        if kernel_wrapper.kernel_manager.is_kernel_alive():
+            return create_success_response(
+                "Kernel is already running",
+                {"stats": kernel_wrapper.get_stats()}
+            )
+        else:
+            # Clean up stale wrapper if exists but kernel is dead
+            try:
+                kernel_wrapper.kernel_manager.cleanup()
+            except Exception as e:
+                logger.error(f"Cleanup of stale kernel failed: {e}")
+            kernel_wrapper = None
+
+    try:
+        # Create new wrapper instance
+        kernel_wrapper = KernelWrapper(kernel_name=kernel_name)
+        
+        # Start kernel synchronously (blocks until complete)
+        kernel_wrapper.kernel_manager.start_kernel()
+        
+        # Verify kernel is alive
+        if not kernel_wrapper.kernel_manager.is_kernel_alive():
+            raise RuntimeError("Kernel failed to start")
+
+        # Initialize channels
+        kernel_wrapper.kernel_manager.ensure_channels_active()
+
+        # Update stats
+        kernel_stats.update({
+            "started_at": time.time(),
+            "total_executions": 0,
+            "failed_executions": 0,
+            "restarts": 0
+        })
+        
+        logger.info(f"Kernel started successfully with PID: {kernel_wrapper.kernel_manager.get_kernel_pid()}")
         
         return create_success_response(
             f"Kernel {kernel_name} started successfully",
             {
                 "kernel_name": kernel_name,
-                "started_at": kernel_stats["started_at"],
-                "stats": kernel_wrapper.get_stats()
+                "status": "running",
+                "pid": kernel_wrapper.kernel_manager.get_kernel_pid()
             }
         )
-        
+            
     except Exception as e:
         logger.error(f"Failed to start kernel: {e}")
+        if kernel_wrapper is not None:
+            try:
+                kernel_wrapper.kernel_manager.shutdown_kernel()
+            except Exception as cleanup_error:
+                logger.error(f"Cleanup failed: {cleanup_error}")
         kernel_wrapper = None
         raise HTTPException(
             status_code=500,
@@ -219,44 +313,33 @@ async def restart_kernel(
     background_tasks: BackgroundTasks,
     kernel: KernelWrapper = Depends(get_kernel_wrapper)
 ):
-    """Restart the kernel endpoint"""
-    global kernel_stats
+    """Triggers a non-blocking kernel restart and returns immediately."""
+    
+    # Use a non-blocking lock to prevent multiple restart requests from starting
+    if not restart_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,  # Conflict
+            detail=create_error_response("Kernel restart already in progress.", "RESTART_IN_PROGRESS")
+        )
     
     try:
-        # Get stats before restart
-        old_stats = kernel.get_stats()
+        # Schedule the synchronous 'perform_restart' method.
+        # FastAPI will correctly run this in a threadpool.
+        # We pass the lock so the background task can release it when done.
+        background_tasks.add_task(kernel.perform_restart, lock=restart_lock)
         
-        # Trigger synchronous restart
-        restart_result = kernel.kernel_manager.restart_kernel()
-        
-        if restart_result.get('status') != 'success':
-            raise RuntimeError(restart_result.get('message', 'Restart failed'))
-        
-        # Update stats
-        kernel_stats["restarts"] += 1
-        
-        # Schedule cleanup
-        background_tasks.add_task(background_kernel_cleanup)
-        
-        return create_success_response(
-            "Kernel restarted successfully",
-            {
-                "restart_count": kernel_stats["restarts"],
-                "previous_uptime": old_stats.get('uptime', 0),
-                "stats": kernel.get_stats(),
-                "restart_details": restart_result
-            }
+        # Immediately return a 202 Accepted response
+        return JSONResponse(
+            status_code=202,
+            content=create_success_response("Kernel restart has been initiated.")
         )
-        
     except Exception as e:
-        logger.error(f"Failed to restart kernel: {e}")
-        kernel_stats["failed_executions"] += 1
+        # If scheduling the task fails, release the lock immediately
+        restart_lock.release()
+        logger.error(f"Failed to initiate kernel restart: {e}")
         raise HTTPException(
             status_code=500,
-            detail=create_error_response(
-                f"Failed to restart kernel: {str(e)}",
-                "KERNEL_RESTART_FAILED"
-            )
+            detail=create_error_response(f"Failed to initiate restart: {str(e)}", "RESTART_INITIATION_FAILED")
         )
 
 @router.post("/kernel/shutdown")
@@ -326,3 +409,33 @@ async def health_check():
             f"Health check failed: {str(e)}",
             "HEALTH_CHECK_FAILED"
         )
+    
+async def background_start_kernel(wrapper: KernelWrapper):
+    loop = asyncio.get_event_loop()
+    try:
+        logger.info("Background kernel start initiated.")
+        await loop.run_in_executor(None, wrapper.kernel_manager.start_kernel)
+        
+        # Verify startup
+        if not wrapper.kernel_manager.is_kernel_alive():
+            raise RuntimeError("Kernel failed to become alive after start.")
+            
+        global kernel_stats, kernel_wrapper
+        kernel_stats.update({
+            "started_at": time.time(),
+            "total_executions": 0,
+            "failed_executions": 0,
+            "restarts": 0
+        })
+        logger.info("Kernel started successfully in background.")
+    except Exception as e:
+        logger.error(f"Background kernel start failed: {e}")
+        # Clean up failed startup
+        try:
+            wrapper.kernel_manager.shutdown_kernel()
+        except Exception as cleanup_error:
+            logger.error(f"Cleanup failed: {cleanup_error}")
+        finally:
+            global kernel_wrapper
+            kernel_wrapper = None
+

@@ -114,6 +114,7 @@ class SafeOutputBuffer:
         self.buffer = []
         self.current_size = 0
         self._lock = threading.RLock()
+        self.kernel_lock = threading.Lock()
         self.truncated = False
     
     def append(self, data: str) -> bool:
@@ -131,45 +132,55 @@ class SafeOutputBuffer:
 
 class Kernel:
     def __init__(self, kernel_name: str = 'python3'):
-        self._km = JupyterKernelManager(kernel_name=kernel_name)
+        self.kernel_name = kernel_name  # Store the kernel name
+        self._km = JupyterKernelManager(kernel_name=self.kernel_name)
         self._client = None
         self._lock = threading.RLock()
         self._healthy = False
         self._cleanup_lock = threading.Lock()
-        self.start_kernel()
-
+        self._restart_in_progress = threading.Event()
+        self.kernel_lock = threading.Lock()
 
     @property
     def client(self):
         with self._lock:
             return self._client
 
-    def start_kernel(self):
+    def start_kernel(self, timeout=30):
+        start_time = time.time()
         with self._lock:
             try:
                 self._km.start_kernel()
+                
+                # Timeout check
+                if time.time() - start_time > timeout:
+                    raise TimeoutError("Kernel startup timed out")
+                    
                 self._client = self._km.client()
-                self._start_channels_with_timeout(10)
+                self._start_channels_with_timeout(min(10, timeout - (time.time() - start_time)))
                 self._healthy = True
             except Exception as e:
-                logger.error(f"Failed to start kernel: {e}")
                 self._healthy = False
                 raise
 
     def _start_channels_with_timeout(self, timeout: int):
         start_time = time.time()
+        last_exception = None
+        
         while time.time() - start_time < timeout:
             try:
                 self._client.start_channels()
                 if all(channel.is_alive() for channel in [
                     self._client.shell_channel,
                     self._client.iopub_channel
-                ]):
+                ] if channel is not None):
                     return
-                time.sleep(0.5)
             except Exception as e:
-                logger.warning(f"Channel start attempt failed: {e}")
-                time.sleep(0.5)
+                last_exception = e
+            time.sleep(0.5)
+        
+        if last_exception:
+            raise RuntimeError(f"Failed to start channels: {last_exception}")
         raise RuntimeError("Failed to start channels within timeout")
 
     def is_kernel_alive(self) -> bool:
@@ -206,74 +217,52 @@ class Kernel:
                 raise RuntimeError("Failed to interrupt kernel")
 
     def restart_kernel(self) -> Dict[str, Any]:
-        """Synchronously restart the kernel with proper cleanup"""
+        """Synchronously restart the kernel with proper cleanup and re-initialization."""
         if self._restart_in_progress.is_set():
-            return {
-                "status": "error",
-                "message": "Restart already in progress",
-                "timestamp": time.time()
-            }
+            return {"status": "error", "message": "Restart already in progress"}
 
         self._restart_in_progress.set()
         try:
             logger.info("Starting kernel restart procedure")
 
-            # 1. Clean shutdown if possible
-            try:
-                if hasattr(self._km, 'shutdown_kernel'):
-                    self._km.shutdown_kernel(now=True)
-                elif hasattr(self._km, '_kill_kernel'):
-                    self._km._kill_kernel()
-            except Exception as e:
-                logger.warning(f"Graceful shutdown failed: {e}")
-
-            # 2. Force kill if still running
-            if self._km.is_alive():
-                try:
-                    if hasattr(self._km, 'kill_kernel'):
-                        self._km.kill_kernel()
-                    elif hasattr(self._km, '_kill_kernel'):
-                        self._km._kill_kernel()
-                except Exception as e:
-                    logger.error(f"Failed to kill kernel: {e}")
-                    raise RuntimeError("Failed to terminate kernel")
-
-            # 3. Clean up client resources
+            # --- Shutdown the OLD kernel and client ---
             if self._client and hasattr(self._client, 'stop_channels'):
                 try:
                     self._client.stop_channels()
                 except Exception as e:
                     logger.warning(f"Error stopping channels: {e}")
 
-            # 4. Start fresh kernel (synchronously)
+            if self._km and self._km.is_alive():
+                try:
+                    self._km.shutdown_kernel(now=True)
+                except Exception as e:
+                    logger.warning(f"Graceful shutdown of old kernel failed: {e}")
+            
+            # --- THE FIX: Create a NEW KernelManager instance ---
+            logger.info("Creating a new kernel manager instance.")
+            self._km = JupyterKernelManager(kernel_name=self.kernel_name)
+            
+            # --- Start the NEW kernel and client ---
             try:
                 self._km.start_kernel()
-                # Create new client with fresh channels
                 self._client = self._km.client()
-                self._client.start_channels()
+                self._start_channels_with_timeout(10) # Use your existing helper
                 self._healthy = True
-                logger.info("Kernel started successfully")
+                logger.info("Kernel restarted and new client is active.")
             except Exception as e:
-                logger.error(f"Kernel startup failed: {e}")
+                logger.error(f"Failed to start new kernel after restart: {e}")
                 self._healthy = False
-                raise RuntimeError("Failed to start kernel")
+                raise RuntimeError(f"Failed to start new kernel: {str(e)}")
 
-            return {
-                "status": "success",
-                "message": "Kernel restarted successfully",
-                "timestamp": time.time()
-            }
+            return {"status": "success", "message": "Kernel restarted successfully"}
 
         except Exception as e:
-            logger.error(f"Kernel restart failed: {e}")
+            logger.error(f"Kernel restart procedure failed: {e}")
             self._healthy = False
-            return {
-                "status": "error",
-                "message": f"Restart failed: {str(e)}",
-                "timestamp": time.time()
-            }
+            return {"status": "error", "message": f"Restart failed: {str(e)}"}
         finally:
             self._restart_in_progress.clear()
+
 
 
     def _trigger_kernel_restart(self):
@@ -369,6 +358,43 @@ class Kernel:
                             pass
             except Exception as e:
                 logger.warning(f"Channel flush warning: {str(e)}")
+    
+    def get_kernel_pid(self) -> Optional[int]:
+        """Get the kernel process ID if available"""
+        with self._lock:
+            try:
+                return self._km.provisioner.get_pid() if hasattr(self._km, 'provisioner') else None
+            except Exception:
+                return None
+
+    def ensure_channels_active(self):
+        """Ensure all channels are active and restart if needed"""
+        with self._lock:
+            if not self.is_kernel_alive():
+                raise RuntimeError("Kernel is not alive")
+                
+            try:
+                # Refresh channels if needed
+                if not all(channel.is_alive() for channel in [
+                    self._client.shell_channel,
+                    self._client.iopub_channel
+                ] if channel is not None):
+                    self._client.stop_channels()
+                    self._client.start_channels()
+                    
+                    # Verify channels are up
+                    for _ in range(3):
+                        if all(channel.is_alive() for channel in [
+                            self._client.shell_channel,
+                            self._client.iopub_channel
+                        ]):
+                            return
+                        time.sleep(0.5)
+                    
+                    raise RuntimeError("Failed to activate channels")
+            except Exception as e:
+                logger.error(f"Channel activation failed: {e}")
+                raise
 
 
 
