@@ -147,21 +147,36 @@ class Kernel:
             return self._client
 
     def start_kernel(self, timeout=30):
-        start_time = time.time()
         with self._lock:
-            try:
-                self._km.start_kernel()
-                
-                # Timeout check
-                if time.time() - start_time > timeout:
-                    raise TimeoutError("Kernel startup timed out")
-                    
-                self._client = self._km.client()
-                self._start_channels_with_timeout(min(10, timeout - (time.time() - start_time)))
-                self._healthy = True
-            except Exception as e:
+            result = {}
+            # declare start_kernel in a thread to avoid blocking
+            def _start():
+                try:
+                    self._km.start_kernel()
+                    result['success'] = True
+                except Exception as e:
+                    result['error'] = e
+
+            thread = threading.Thread(target=_start)
+            thread.start()
+            thread.join(timeout=timeout)
+
+            if not result.get('success'):
                 self._healthy = False
-                raise
+                try:
+                    self._km.shutdown_kernel(now=True)
+                except Exception:
+                    pass
+
+                if 'error' in result:
+                    raise result['error']
+                else:
+                    raise TimeoutError(f"Kernel failed to start within {timeout}s")
+
+            # Proceed after successful start
+            self._client = self._km.client()
+            self._start_channels_with_timeout(min(10, timeout))
+            self._healthy = True
 
     def _start_channels_with_timeout(self, timeout: int):
         start_time = time.time()
@@ -355,6 +370,7 @@ class Kernel:
                             while True:
                                 channel.get_msg(timeout=0.1)
                         except (queue.Empty, AttributeError):
+                            logger.info(f"{channel_name} queue is empty or get_msg method does not exist for {channel_name}")
                             pass
             except Exception as e:
                 logger.warning(f"Channel flush warning: {str(e)}")

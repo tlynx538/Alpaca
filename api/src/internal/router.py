@@ -1,4 +1,5 @@
 # src/internal/router.py
+# TODO: Update HTTPException correctly
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
 from internal.kernel_wrapper import KernelWrapper
@@ -26,7 +27,10 @@ restart_lock = threading.Lock()
 
 # Helper functions
 def get_kernel_wrapper() -> KernelWrapper:
-    """Dependency to ensure kernel is available"""
+    """
+        Checks if kernel_wrapper is initialized and alive.
+        Raises HTTPException if kernel is not started or not alive.
+    """
     global kernel_wrapper
     if kernel_wrapper is None:
         raise HTTPException(
@@ -170,7 +174,7 @@ async def start_kernel(kernel_name: str = 'python3'):
             kernel_wrapper = None
 
     try:
-        # Create new wrapper instance
+        # Create new wrapper instance, python3
         kernel_wrapper = KernelWrapper(kernel_name=kernel_name)
         
         # Start kernel synchronously (blocks until complete)
