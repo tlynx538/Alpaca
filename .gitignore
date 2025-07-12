@@ -5,3 +5,7 @@ api/src/__pycache__/
 api/src/**/__pycache__/
 api/.env
 api/src/internal/tests/__pycache__/
+# added temporarily to these files being used for testing in Docker
+api/README.md
+README.md
+LICENSE
