@@ -145,7 +145,9 @@ class Kernel:
     def client(self):
         with self._lock:
             return self._client
-
+    '''
+        Start kernel with a timeout to avoid blocking the main thread.
+    '''
     def start_kernel(self, timeout=30):
         with self._lock:
             result = {}
@@ -178,6 +180,9 @@ class Kernel:
             self._start_channels_with_timeout(min(10, timeout))
             self._healthy = True
 
+    '''
+        Start channels with a timeout to ensure they are ready.
+    '''
     def _start_channels_with_timeout(self, timeout: int):
         start_time = time.time()
         last_exception = None
@@ -394,7 +399,9 @@ class Kernel:
                 if not all(channel.is_alive() for channel in [
                     self._client.shell_channel,
                     self._client.iopub_channel
+                                                   
                 ] if channel is not None):
+                    # restarts channels if not alive
                     self._client.stop_channels()
                     self._client.start_channels()
                     
