@@ -4,13 +4,13 @@ from kernel.execution_tracker import ExecutionTracker, ExecutionState
 from kernel.output_buffer import OutputBufferManager
 from kernel.code_executor import CodeExecutor
 from kernel.health_monitor import KernelHealthMonitor
-from kernel.package_installer import PackageInstaller
 from fastapi.responses import StreamingResponse
-from typing import Dict, Any, Union, List, Callable
+from typing import Dict, Any, Union, List, Optional
 import threading
 import logging
 import gc
 import time
+import asyncio
 from collections import defaultdict
 
 # Configure logging
@@ -30,13 +30,10 @@ class KernelWrapper:
         self.max_executions = max_executions
         self._shutdown_event = threading.Event()
         
-        # Initialize ExecutionTracker for managing executions
+        # Initialize core components
         self.execution_tracker = ExecutionTracker(max_executions=max_executions)
-        
-        # Initialize OutputBufferManager for handling output processing
         self.output_manager = OutputBufferManager(self.execution_tracker)
-        
-        # Initialize KernelManager
+
         try:
             self.kernel_manager = Kernel(kernel_name=kernel_name)
             logger.info(f"Kernel {kernel_name} initialized successfully")
@@ -44,7 +41,6 @@ class KernelWrapper:
             logger.error(f"Failed to initialize kernel: {e}")
             raise RuntimeError(f"Failed to initialize kernel: {e}")
         
-        # Initialize CodeExecutor for handling code execution
         self.code_executor = CodeExecutor(
             kernel_manager=self.kernel_manager,
             execution_tracker=self.execution_tracker,
@@ -52,19 +48,26 @@ class KernelWrapper:
             max_concurrent_executions=max_concurrent_executions
         )
         
-        # Initialize KernelHealthMonitor for health monitoring
         self.health_monitor = KernelHealthMonitor(
             kernel_manager=self.kernel_manager,
             shutdown_event=self._shutdown_event
         )
         
-        # Initialize PackageInstaller for package management
-        self.package_installer = PackageInstaller(
-            kernel_manager=self.kernel_manager
-        )
-        
         # Start background tasks
         self._start_background_tasks()
+
+    @property
+    def kernel_pid(self) -> Optional[int]:
+        """Get the kernel process ID"""
+        return self.kernel_manager.get_kernel_pid()
+
+    def is_kernel_alive(self) -> bool:
+        """Check if kernel is alive"""
+        return self.kernel_manager.is_kernel_alive()
+
+    async def cleanup(self, force=False):
+        """Clean up kernel resources"""
+        await asyncio.to_thread(self.kernel_manager.cleanup, force)
 
     def _start_background_tasks(self):
         """Start background cleanup and monitoring tasks"""
@@ -74,8 +77,6 @@ class KernelWrapper:
             name="KernelCleanup"
         )
         self._cleanup_thread.start()
-        
-        # Start health monitoring thread via KernelHealthMonitor
         self.health_monitor.start_monitoring()
 
     def _background_cleanup(self):
@@ -85,17 +86,10 @@ class KernelWrapper:
         while not self._shutdown_event.is_set():
             try:
                 current_time = time.time()
-                
-                # Clean up stale executions
                 self.execution_tracker._cleanup_stale_executions(current_time)
-                
-                # Clean up oversized buffers using OutputBufferManager
                 self.output_manager.cleanup_oversized_buffers()
-                
-                # Clean up completed executions if over limit
                 self.execution_tracker._cleanup_excess_executions()
                 
-                # Force garbage collection periodically
                 if current_time % 120 < cleanup_interval:  # Every 2 minutes
                     gc.collect()
                 
@@ -111,21 +105,14 @@ class KernelWrapper:
             self.kernel_manager.shutdown_kernel()
 
     def execute_code(self, code: str, timeout: int = 30) -> StreamingResponse:
-        """Execute user code using CodeExecutor.
-        
-        Args:
-            code (str): The code to execute.
-            timeout (int): Timeout for streaming output in seconds.
-            
-        Returns:
-            StreamingResponse: A streaming response object for real-time output.
-        """
+        """Execute user code using CodeExecutor."""
         return self.code_executor.execute_code(code, timeout)
 
-    def install_packages(self, packages: Union[str, List[str]], 
+    async def install_packages(self, packages: Union[str, List[str]], 
                          upgrade: bool = False, 
                          timeout: int = 300) -> Dict[str, str]:
-        """Install packages using PackageInstaller.
+        """
+        Install packages using kernel execution.
         
         Args:
             packages: Either a single package name or list of packages.
@@ -135,7 +122,20 @@ class KernelWrapper:
         Returns:
             Dictionary with package names as keys and installation results as values.
         """
-        return self.package_installer.install_packages(packages, upgrade, timeout)
+        if isinstance(packages, str):
+            packages = [packages]
+            
+        results = {}
+        for pkg in packages:
+            cmd = f"!pip install {pkg} --upgrade" if upgrade else f"!pip install {pkg}"
+            try:
+                # Using code executor for consistent execution handling
+                response = self.execute_code(cmd, timeout)
+                results[pkg] = "Success"
+            except Exception as e:
+                results[pkg] = f"Failed: {str(e)}"
+        
+        return results
 
     def get_stats(self) -> Dict[str, Any]:
         """Enhanced statistics"""
@@ -166,7 +166,7 @@ class KernelWrapper:
         """
         logger.info("Background kernel restart process has started.")
         try:
-            # --- 1. Gracefully stop background monitoring ---
+            # 1. Gracefully stop background monitoring
             logger.info("Stopping health monitor and background threads for restart.")
             if hasattr(self, '_shutdown_event'):
                 self._shutdown_event.set()
@@ -175,42 +175,37 @@ class KernelWrapper:
             if hasattr(self, '_cleanup_thread') and self._cleanup_thread.is_alive():
                 self._cleanup_thread.join(timeout=5)
 
-            # --- 2. Shut down the old kernel manager ---
+            # 2. Shut down the old kernel manager
             logger.info("Shutting down the current kernel manager instance.")
             if self.kernel_manager and self.kernel_manager.is_kernel_alive():
                 self.kernel_manager.shutdown_kernel()
 
-            # --- 3. Create and start a new kernel instance ---
+            # 3. Create and start a new kernel instance
             logger.info("Creating and starting a new kernel manager instance.")
             new_kernel_manager = Kernel(kernel_name=self.kernel_manager.kernel_name)
-            new_kernel_manager.start_kernel()  # This is the blocking part
+            new_kernel_manager.start_kernel()
 
             if not new_kernel_manager.is_kernel_alive():
                 raise RuntimeError("The new kernel failed to start during restart.")
 
-            # --- 4. Re-initialize the wrapper with the new kernel ---
+            # 4. Re-initialize the wrapper with the new kernel
             logger.info("Re-initializing wrapper components with the new kernel.")
             self.kernel_manager = new_kernel_manager
-            
-            # Re-create and re-assign components that depend on the kernel manager
-            self.package_installer = PackageInstaller(kernel_manager=self.kernel_manager)
-            self.code_executor.kernel_manager = self.kernel_manager # Update existing instance
+            self.code_executor.kernel_manager = self.kernel_manager
 
-            # --- 5. Restart background services ---
+            # 5. Restart background services
             logger.info("Restarting health monitor and background threads.")
-            self._shutdown_event.clear()  # Reset the event for new threads
+            self._shutdown_event.clear()
             self.health_monitor = KernelHealthMonitor(
                 kernel_manager=self.kernel_manager,
                 shutdown_event=self._shutdown_event
             )
-            self._start_background_tasks() # This will create and start new threads
+            self._start_background_tasks()
 
             logger.info("Kernel restart completed successfully.")
 
         except Exception as e:
             logger.critical(f"A critical error occurred during kernel restart: {e}", exc_info=True)
-            # You may want to implement a 'failed' state here to prevent further use
         finally:
-            # --- 6. ALWAYS release the lock ---
             lock.release()
             logger.info("Restart lock has been released.")

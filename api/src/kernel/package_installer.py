@@ -1,132 +1,148 @@
-# package_installer.py
+import sys
+import os
+import asyncio
 import logging
-import time
 import queue
-from typing import Dict, Union, List, Callable
-from kernel.kernel_manage import Kernel
+from typing import AsyncGenerator, Optional
+from concurrent.futures import ThreadPoolExecutor
 
-# Setup logger
+# Setup minimal logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+from internal.kernel_wrapper import KernelWrapper
+
 class PackageInstaller:
-    def __init__(self, kernel_manager: Kernel):
-        """Initialize PackageInstaller with kernel manager.
+    def __init__(self, kernel: KernelWrapper, max_workers: int = 4):
+        self.kernel = kernel
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._shutdown_event = asyncio.Event()
         
-        Args:
-            kernel_manager (KernelManager): Manages kernel operations for package installation.
-        """
-        self.kernel_manager = kernel_manager
-
-    def install_packages(self, packages: Union[str, List[str]], upgrade: bool = False, timeout: int = 300) -> Dict[str, str]:
-        """
-        Install one or more Python packages in the kernel using pip.
-        
-        Args:
-            packages: Either a single package name or list of packages
-                      (supports pip syntax like "numpy>=1.20", "pandas[extra]")
-            upgrade: Whether to upgrade if already installed
-            timeout: Maximum installation time in seconds per package
-        
-        Returns:
-            Dictionary with package names as keys and installation results as values
-        """
-        if not self.kernel_manager.is_kernel_alive():
-            raise RuntimeError("Cannot install packages - kernel is not running")
-
-        # Normalize input to list
-        if isinstance(packages, str):
-            packages = [packages]
-        elif not isinstance(packages, list):
-            raise ValueError("packages must be string or list of strings")
-
-        results = {}
-        pip_command_template = "pip install {package} {upgrade} --quiet"
-        
-        for package in packages:
-            try:
-                # Skip empty strings
-                if not package or not isinstance(package, str):
-                    results[package] = "Invalid package name"
-                    continue
-
-                # Check if already installed (basic check)
-                base_pkg = package.split('[')[0].split('==')[0].split('>')[0].split('<')[0]
-                check_code = f"import importlib.util; print(importlib.util.find_spec('{base_pkg}') is not None)"
-                
-                check_result = []
-                def collect_check_output(msg):
-                    if msg['header']['msg_type'] in ('stream', 'execute_result'):
-                        check_result.append(msg['content'].get('text', ''))
-                
-                msg_id = self.kernel_manager.client.execute(check_code)
-                self._capture_output(msg_id, collect_check_output, timeout=10)
-
-                if any("True" in line for line in check_result) and not upgrade:
-                    results[package] = "Already installed"
-                    continue
-
-                # Build install command
-                cmd = pip_command_template.format(
-                    package=package,
-                    upgrade="--upgrade" if upgrade else ""
-                )
-
-                # Special handling for specific packages
-                post_install = ""
-                if "matplotlib" in package.lower():
-                    post_install = " && python -c \"import matplotlib; matplotlib.use('Agg')\""
-
-                # Execute installation
-                install_output = []
-                def collect_install_output(msg):
-                    if msg['header']['msg_type'] in ('stream', 'execute_result'):
-                        install_output.append(msg['content'].get('text', ''))
-                    elif msg['header']['msg_type'] == 'error':
-                        install_output.extend(msg['content']['traceback'])
-
-                msg_id = self.kernel_manager.client.execute(cmd + post_install)
-                success = self._capture_output(msg_id, collect_install_output, timeout)
-
-                # Verify installation
-                verify_result = []
-                def collect_verify_output(msg):
-                    if msg['header']['msg_type'] in ('stream', 'execute_result'):
-                        verify_result.append(msg['content'].get('text', ''))
-
-                msg_id = self.kernel_manager.client.execute(check_code)
-                self._capture_output(msg_id, collect_verify_output, timeout=10)
-
-                if any("True" in line for line in verify_result):
-                    results[package] = "Success"
-                else:
-                    results[package] = f"Failed: {''.join(install_output)[:500]}..."
-
-            except Exception as e:
-                results[package] = f"Error: {str(e)}"
-
-        return results
-
-    def _capture_output(self, msg_id: str, callback: Callable, timeout: int) -> bool:
-        """Helper method to capture execution output.
-        
-        Args:
-            msg_id (str): The message ID of the execution.
-            callback (Callable): Function to process the output message.
-            timeout (int): Timeout for capturing output in seconds.
+    async def install_packages(self, packages: list, upgrade: bool = False) -> AsyncGenerator[str, None]:
+        """Install packages with streaming output"""
+        try:
+            # Start kernel if not already running
+            if not self.kernel.kernel_manager.is_alive():
+                await self._execute_in_thread(self.kernel.kernel_manager.start_kernel)
+                self.kernel.kernel_manager.client().start_channels()
             
-        Returns:
-            bool: True if execution completed within timeout, False otherwise.
-        """
-        start_time = time.time()
-        while (time.time() - start_time) < timeout:
-            try:
-                msg = self.kernel_manager.client.get_iopub_msg(timeout=1.0)
-                if msg['parent_header']['msg_id'] == msg_id:
-                    if msg['header']['msg_type'] == 'status':
-                        if msg['content']['execution_state'] == 'idle':
-                            return True
-                    callback(msg)
-            except queue.Empty:
-                continue
-        return False
+            # Install each package with streaming output
+            for pkg in packages:
+                install_cmd = f"!pip install {pkg} --upgrade" if upgrade else f"!pip install {pkg}"
+                yield f"\nInstalling {pkg}...\n"
+                
+                # Execute and stream output
+                msg_id = await self._execute_in_thread(
+                    lambda: self.kernel.kernel_manager.client().execute(install_cmd)
+                )
+                
+                async for output in self._stream_output(msg_id):
+                    yield output
+                    
+            yield "\nInstallation complete\n"
+            
+        except Exception as e:
+            yield f"\nError during installation: {str(e)}\n"
+            raise
+        finally:
+            await self._cleanup()
+
+    async def _execute_in_thread(self, func) -> str:
+        """Execute function in thread pool and return message ID"""
+        loop = asyncio.get_running_loop()
+        if callable(func):
+            return await loop.run_in_executor(self._executor, func)
+        return await loop.run_in_executor(self._executor, lambda: func)
+
+    async def _stream_output(self, msg_id: str) -> AsyncGenerator[str, None]:
+        """Stream output from kernel execution"""
+        client = self.kernel.kernel_manager.client()
+        received_idle = False
+        
+        try:
+            while not self._shutdown_event.is_set() and not received_idle:
+                msg = await self._get_iopub_message(client)
+                if msg is None:
+                    await asyncio.sleep(0.05)
+                    continue
+
+                # Check for idle status
+                if (msg.get('header', {}).get('msg_type') == 'status' and 
+                    msg.get('content', {}).get('execution_state') == 'idle'):
+                    received_idle = True
+                    continue
+
+                # Process and yield output
+                output = self._process_message(msg)
+                if output:
+                    yield output
+                    
+        except Exception as e:
+            logger.error(f"Streaming error: {e}")
+            yield f"\n[Streaming error: {str(e)}]\n"
+
+    async def _get_iopub_message(self, client, timeout: float = 0.1) -> Optional[dict]:
+        """Get message with minimal delay"""
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                self._executor,
+                lambda: client.get_iopub_msg(timeout=timeout)
+            )
+        except (queue.Empty, asyncio.TimeoutError):
+            return None
+        except Exception as e:
+            logger.debug(f"Message error: {e}")
+            return None
+
+    def _process_message(self, msg: dict) -> str:
+        """Process kernel message into output string"""
+        content = msg.get('content', {})
+        
+        if 'text' in content:
+            return content['text']
+        elif 'data' in content:  # For rich output
+            return content['data'].get('text/plain', '')
+        elif 'name' in content and content['name'] == 'stdout':
+            return content.get('text', '')
+        return ''
+
+    async def _cleanup(self):
+        """Cleanup resources"""
+        try:
+            if hasattr(self.kernel, 'health_monitor'):
+                self.kernel.health_monitor.pause_monitoring()
+            
+            await self._execute_in_thread(self.kernel.kernel_manager.shutdown_kernel)
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+        finally:
+            if hasattr(self.kernel, 'health_monitor'):
+                self.kernel.health_monitor.resume_monitoring()
+
+async def async_main():
+    kw = KernelWrapper(kernel_name='python3')
+    installer = PackageInstaller(kw)
+    
+    try:
+        # Stream installation output
+        async for output in installer.install_packages(
+            ['numpy', 'matplotlib', 'seaborn'], 
+            upgrade=True
+        ):
+            print(output, end='', flush=True)
+            
+    except Exception as e:
+        print(f"\nError: {e}")
+    finally:
+        await installer._cleanup()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(async_main())
+    except KeyboardInterrupt:
+        print("\nShutting down gracefully...")
+        kw = KernelWrapper(kernel_name='python3')
+        kw.kernel_manager.shutdown_kernel()
