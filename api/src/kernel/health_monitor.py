@@ -23,36 +23,55 @@ class KernelHealthMonitor:
         self._shutdown_event = threading.Event()
         self._restart_in_progress = threading.Event()
         self._monitor_thread: Optional[threading.Thread] = None
+        self._monitoring_paused = threading.Event()
 
     def start_monitoring(self):
         """Start the health monitoring thread."""
-        monitor_thread = threading.Thread(
+        self._monitor_thread = threading.Thread(
             target=self._health_monitor,
             daemon=True,
             name="KernelHealthMonitor"
         )
-        monitor_thread.start()
-        return monitor_thread
+        self._monitor_thread.start()
+        return self._monitor_thread
+
 
     def _health_monitor(self):
         """Monitor kernel health and trigger restart if needed."""
+        logger.info("Entered health monitor loop")
         while not self._shutdown_event.is_set():
             try:
+                if self._monitoring_paused.is_set():
+                    logger.debug("Health monitoring paused, sleeping")
+                    time.sleep(1)
+                    continue
+
                 current_time = time.time()
+
+                # Check only if the interval has passed
                 if current_time - self._last_kernel_check > self.check_interval:
                     self._check_kernel_health()
-                    self._last_kernel_check = current_time
-                time.sleep(5)  # Check every 5 seconds
+                    self._last_kernel_check = time.time()
+
+                time.sleep(1)
             except Exception as e:
                 logger.warning(f"Health monitor error: {e}")
                 time.sleep(10)
+
+
+
 
     def _check_kernel_health(self):
         """Check if kernel is healthy and restart if needed."""
         try:
             if self._restart_in_progress.is_set():
                 return  # Restart already in progress
-            is_alive = self.kernel_manager.is_kernel_alive()
+            try:
+                is_alive = self.kernel_manager.is_kernel_alive()
+            except Exception as e:
+                logger.warning(f"is_kernel_alive failed: {e}")
+                is_alive = False
+
             if not is_alive and self._kernel_healthy:
                 logger.warning("Kernel appears to be dead, attempting restart")
                 self.kernel_manager._trigger_kernel_restart()
@@ -116,6 +135,19 @@ class KernelHealthMonitor:
                 logger.info("Health monitor stopped successfully.")
         
         self._monitor_thread = None
+    
+    def pause_monitoring(self):
+        """Temporarily pause health checks"""
+        self._monitoring_paused.set()
+        logger.info("Health monitoring paused")
+
+    def resume_monitoring(self):
+        """Resume health checks"""
+        self._monitoring_paused.clear()
+        logger.info("Health monitoring resumed")
+
+    def is_monitoring_paused(self) -> bool:
+        return self._monitoring_paused.is_set()
 
 
 

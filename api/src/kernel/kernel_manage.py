@@ -145,6 +145,23 @@ class Kernel:
     def client(self):
         with self._lock:
             return self._client
+
+    @client.setter
+    def client(self, new_client):
+        with self._lock:
+            if self._client and hasattr(self._client, 'stop_channels'):
+                try:
+                    self._client.stop_channels()  # Close existing channels
+                except Exception as e:
+                    logger.warning(f"Error stopping existing client channels: {e}")
+            self._client = new_client
+            if self._client:
+                try:
+                    self._client.start_channels()  # Start new client channels
+                except Exception as e:
+                    logger.error(f"Failed to start new client channels: {e}")
+                    self._healthy = False
+                    raise RuntimeError(f"Failed to start new client channels: {str(e)}")
     '''
         Start kernel with a timeout to avoid blocking the main thread.
     '''
@@ -298,16 +315,68 @@ class Kernel:
         )
         restart_thread.start()
 
-    def shutdown_kernel(self):
-        with self._lock:
+    def shutdown_kernel(self, now: bool = False):
+        """Shutdown the kernel with proper async/sync handling"""
+        try:
+            if now:
+                # Forceful shutdown path
+                try:
+                    if hasattr(self._km, 'kill_kernel'):
+                        self._km.kill_kernel()
+                    elif hasattr(self._km, 'shutdown_kernel'):
+                        # Try sync shutdown first
+                        self._km.shutdown_kernel(now=True)
+                    else:
+                        logger.warning("No force shutdown method available")
+                        raise RuntimeError("No force shutdown available")
+                except Exception as e:
+                    logger.warning(f"Force shutdown attempt failed: {e}")
+                    # Last resort - terminate process directly
+                    if hasattr(self._km, 'proc') and self._km.proc:
+                        self._km.proc.terminate()
+            else:
+                # Graceful shutdown path
+                try:
+                    if hasattr(self._km, 'shutdown_kernel'):
+                        # Try sync shutdown first
+                        self._km.shutdown_kernel()
+                    else:
+                        logger.warning("No graceful shutdown method available")
+                        raise RuntimeError("No graceful shutdown available")
+                except Exception as e:
+                    logger.warning(f"Graceful shutdown failed: {e}")
+                    # Fall back to force if graceful fails
+                    return self.shutdown_kernel(now=True)
+
+            # Ensure cleanup regardless of shutdown method
+            self._post_shutdown_cleanup()
+
+        except Exception as e:
+            logger.error(f"Shutdown error: {e}")
+            raise RuntimeError(f"Kernel shutdown failed: {e}")
+
+    def _post_shutdown_cleanup(self):
+        """Synchronous cleanup after shutdown"""
+        try:
+            # 1. Stop channels if they exist
+            if hasattr(self, '_client') and self._client:
+                try:
+                    if hasattr(self._client, 'stop_channels'):
+                        self._client.stop_channels()
+                except Exception as e:
+                    logger.warning(f"Error stopping channels: {e}")
+
+            # 2. Flush any remaining messages
             try:
-                if hasattr(self._client, 'stop_channels'):
-                    self._client.stop_channels()
-                self._km.shutdown_kernel()
-                self._healthy = False
+                self.flush_channels(timeout=2)  # Short timeout for flush
             except Exception as e:
-                logger.error(f"Failed to shutdown kernel: {e}")
-                raise
+                logger.warning(f"Channel flush failed: {e}")
+
+            # 3. Clear internal state
+            self._healthy = False
+            logger.info("Post-shutdown cleanup completed")
+        except Exception as e:
+            logger.error(f"Post-shutdown cleanup failed: {e}")
     
     def _restart_kernel_async(self):
         """Async kernel restart with proper synchronization."""
@@ -351,35 +420,83 @@ class Kernel:
         except Exception as e:
             logger.error(f"Error during internal kernel shutdown: {e}")
 
-    def cleanup(self):
-        """Thread-safe kernel cleanup"""
+    def cleanup(self, force=False):
+        """Thread-safe kernel cleanup with force option"""
         with self._cleanup_lock:
             try:
-                self.flush_channels()
-                if hasattr(self._client, 'stop_channels'):
-                    self._client.stop_channels()
-            except Exception as e:
-                logger.warning(f"Cleanup warning: {str(e)}")
+                # Step 1: Flush channels with timeout
+                try:
+                    self.flush_channels(timeout=5)  # Added timeout parameter
+                except Exception as e:
+                    logger.warning(f"Channel flush warning: {str(e)}")
 
-    def flush_channels(self):
-        """Safely flush all kernel channels"""
-        with self._cleanup_lock:
-            if not self._client:
-                return
-            
-            try:
-                for channel_name in ['iopub_channel', 'shell_channel', 'stdin_channel', 'hb_channel']:
-                    channel = getattr(self._client, channel_name, None)
-                    if channel and hasattr(channel, 'get_msg'):
+                # Step 2: Stop channels if they exist
+                if hasattr(self._client, 'stop_channels'):
+                    try:
+                        self._client.stop_channels()
+                    except Exception as e:
+                        logger.warning(f"Channel stop warning: {str(e)}")
+
+                # Step 3: Forceful cleanup if requested
+                if force:
+                    if hasattr(self, '_km'):
                         try:
-                            while True:
-                                channel.get_msg(timeout=0.1)
-                        except (queue.Empty, AttributeError):
-                            logger.info(f"{channel_name} queue is empty or get_msg method does not exist for {channel_name}")
-                            pass
+                            self._km.shutdown_kernel(now=True)
+                        except Exception as e:
+                            logger.error(f"Force shutdown error: {str(e)}")
+
+                # Step 4: Cleanup executor if exists
+                if hasattr(self, '_executor'):
+                    self._executor.shutdown(wait=False)
+
+                logger.info("Cleanup completed successfully")
+                return True
+                
             except Exception as e:
-                logger.warning(f"Channel flush warning: {str(e)}")
-    
+                logger.error(f"Cleanup failed: {str(e)}")
+                return False
+            finally:
+                self._is_cleaned_up = True
+
+    def flush_channels(self, timeout=0.5):
+        """Interrupt-safe channel flushing"""
+        if not hasattr(self, '_client') or not self._client:
+            return True
+
+        start_time = time.time()
+        
+        try:
+            with self._cleanup_lock:
+                for channel_name in ['shell', 'iopub', 'stdin', 'hb']:
+                    # Safe attribute check
+                    channel = getattr(self._client, f"{channel_name}_channel", None)
+                    if not channel:
+                        continue
+
+                    # Critical section - prevent interrupts
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(
+                            threading._ignore_during_cleanup()  # Disable GC
+                        )
+                        
+                        try:
+                            # Non-blocking check
+                            channel.get_msg(timeout=min(0.05, timeout))
+                            logger.debug(f"Flushed {channel_name}")
+                        except (queue.Empty, KeyboardInterrupt):
+                            continue
+                        except Exception as e:
+                            logger.debug(f"Flush error on {channel_name}: {e}")
+                            
+                    # Check total timeout
+                    if time.time() - start_time >= timeout:
+                        break
+
+            return True
+
+        except Exception:
+            return False
+
     def get_kernel_pid(self) -> Optional[int]:
         """Get the kernel process ID if available"""
         with self._lock:
@@ -418,6 +535,15 @@ class Kernel:
             except Exception as e:
                 logger.error(f"Channel activation failed: {e}")
                 raise
+
+    def reconnect_client(self):
+        """Reconnect kernel client, useful after resume from pause or cleanup."""
+        try:
+            self.client = self._km.client()
+            logger.info("Kernel client reconnected successfully")
+        except Exception as e:
+            logger.error(f"Failed to reconnect kernel client: {e}")
+
 
 
 

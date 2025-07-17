@@ -19,7 +19,7 @@ app.add_middleware(
 
 @app.get("/")
 def home():
-    return {"message": "This is Alpaca API. Use the endpoints to interact with the Jupyter kernel."}
+    return {"message": "This is Europa API. Use the endpoints to interact with the Jupyter kernel."}
 
 app.middleware('http')(debug_middleware)
 app.include_router(router, prefix="/api", tags=["kernel"])
