@@ -1,8 +1,15 @@
 <<<<<<< HEAD
+<<<<<<< HEAD
 # Europa Jupyter Interface REST API
 =======
 # Europa Jupyter REST API
 >>>>>>> 371823a (Reinstated READMEs)
+=======
+# Europa Jupyter REST API
+=======
+# Europa Jupyter Interface REST API
+>>>>>>> 707c5b8 (Reinstated READMEs)
+>>>>>>> e3f5d5b (Reinstated READMEs)
 
 This REST API can
 - provision an ipython kernel
@@ -31,9 +38,15 @@ The Main Goal of this API is to run python code via REST API.
 | POST   | /api/kernel/shutdown            | Shutdown the kernel                         |
 | POST   | /api/kernel/execute/complete    | Check if code is complete (code completeness check) |
 <<<<<<< HEAD
+<<<<<<< HEAD
 =======
 | POST   | /api/kernel/install-packages    | Install Python Packages to Jupyter Kernel             |
 >>>>>>> 371823a (Reinstated READMEs)
+=======
+| POST   | /api/kernel/install-packages    | Install Python Packages to Jupyter Kernel             |
+=======
+>>>>>>> 707c5b8 (Reinstated READMEs)
+>>>>>>> e3f5d5b (Reinstated READMEs)
 
 ### Run the FastAPI server
 `fastapi dev main.py`
