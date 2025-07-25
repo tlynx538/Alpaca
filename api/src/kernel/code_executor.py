@@ -1,329 +1,270 @@
-# src/internal/router.py
-from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
-from fastapi.responses import StreamingResponse, JSONResponse
-from internal.kernel_wrapper import KernelWrapper
-from internal.models import CodeRequest, CodeCompleteRequest, PackageInstallRequest
-from typing import Optional, Dict, Any, Union, List
+# code_executor.py
 import logging
-import time
+import ast
+import re
+import queue
 import asyncio
-import threading 
+import time
+import threading
+from typing import Dict, Any, AsyncGenerator, Union, List, Optional
+from fastapi.responses import StreamingResponse
+from concurrent.futures import ThreadPoolExecutor
+from kernel.execution_tracker import ExecutionTracker, ExecutionState
+from kernel.output_buffer import OutputBufferManager
 
-# Configure logging
+# Setup logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
-
-# Global kernel manager with proper lifecycle management
-kernel_wrapper: Optional[KernelWrapper] = None
-kernel_stats = {
-    "started_at": None,
-    "total_executions": 0,
-    "failed_executions": 0,
-    "restarts": 0
-}
-restart_lock = threading.Lock()
-
-# Helper functions
-def get_kernel_wrapper() -> KernelWrapper:
-    """Checks if kernel_wrapper is initialized and alive."""
-    global kernel_wrapper
-    if kernel_wrapper is None:
-        raise HTTPException(
-            status_code=503, 
-            detail="Kernel not started. Please start the kernel first."
+class CodeExecutor:
+    def __init__(self, kernel_manager: Any, 
+                 execution_tracker: ExecutionTracker, 
+                 output_manager: OutputBufferManager,
+                 max_concurrent_executions: int = 3):
+        """
+        Initialize CodeExecutor with proper async/thread handling.
+        
+        Args:
+            kernel_manager: Manages kernel lifecycle and operations
+            execution_tracker: Tracks execution states and metadata
+            output_manager: Handles output processing and buffering
+            max_concurrent_executions: Maximum concurrent executions allowed
+        """
+        self.kernel_manager = kernel_manager
+        self.execution_tracker = execution_tracker
+        self.output_manager = output_manager
+        self.max_concurrent_executions = max_concurrent_executions
+        self._shutdown_event = threading.Event()
+        self._executor = ThreadPoolExecutor(max_workers=4)
+        
+    async def execute_code(self, code: str, timeout: int = 30) -> StreamingResponse:
+        """Execute code and return streaming response"""
+        # Input validation and kernel checks remain the same...
+        
+        # Execute code and get message ID
+        msg_id = await self._execute_in_thread(code)
+        self.execution_tracker.add_execution(msg_id)
+        
+        # Create and return StreamingResponse directly
+        return StreamingResponse(
+            self._generate_output(msg_id, timeout),
+            media_type='text/plain',
+            headers={'X-Execution-ID': msg_id}
         )
-    if not kernel_wrapper.is_kernel_alive():
-        raise HTTPException(
-            status_code=503,
-            detail="Kernel is not running. Please restart the kernel."
+
+    async def _execute_in_thread(self, code: str) -> str:
+        """Execute code in thread pool"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor,
+            lambda: self._execute_code_sync(code)
         )
-    return kernel_wrapper
 
-def create_success_response(message: str, data: Optional[Dict[Any, Any]] = None) -> Dict[str, Any]:
-    """Standardized success response format"""
-    return {
-        "status": "success",
-        "message": message,
-        "timestamp": time.time(),
-        **({"data": data} if data else {})
-    }
+    def _execute_code_sync(self, code: str) -> str:
+        """Synchronous code execution"""
+        self.kernel_manager.ensure_channels_active()
+        return self.kernel_manager.client.execute(code)
 
-def create_error_response(message: str, error_code: Optional[str] = None) -> Dict[str, Any]:
-    """Standardized error response format"""
-    return {
-        "status": "error",
-        "message": message,
-        "timestamp": time.time(),
-        **({"error_code": error_code} if error_code else {})
-    }
-
-async def background_kernel_cleanup(kernel: KernelWrapper = None, force=False):
-    """Enhanced background cleanup"""
-    if not kernel:
-        logger.warning("No kernel provided for cleanup")
-        return False
-
-    try:
-        await kernel.cleanup(force=force)
-        return True
-    except Exception as e:
-        logger.error(f"Cleanup failed: {e}")
-        return False
-
-@router.post("/kernel/start")
-async def start_kernel(kernel_name: str = 'python3'):
-    global kernel_wrapper, kernel_stats
-    
-    if kernel_wrapper is not None:
-        if kernel_wrapper.is_kernel_alive():
-            return create_success_response(
-                "Kernel is already running",
-                {"stats": kernel_wrapper.get_stats()}
+    async def _check_code_completeness(self, code: str):
+        """Check if code is syntactically complete"""
+        try:
+            loop = asyncio.get_running_loop()
+            reply = await loop.run_in_executor(
+                self._executor,
+                lambda: self._check_completeness_sync(code)
             )
-        else:
-            try:
-                await kernel_wrapper.cleanup()
-            except Exception as e:
-                logger.error(f"Cleanup of stale kernel failed: {e}")
-            kernel_wrapper = None
-
-    try:
-        kernel_wrapper = KernelWrapper(kernel_name=kernel_name)
-        await asyncio.to_thread(kernel_wrapper.kernel_manager.start_kernel)
-        
-        if not kernel_wrapper.is_kernel_alive():
-            raise RuntimeError("Kernel failed to start")
-
-        kernel_stats.update({
-            "started_at": time.time(),
-            "total_executions": 0,
-            "failed_executions": 0,
-            "restarts": 0
-        })
-        
-        return create_success_response(
-            f"Kernel {kernel_name} started successfully",
-            {
-                "kernel_name": kernel_name,
-                "status": "running",
-                "pid": kernel_wrapper.kernel_pid
-            }
-        )
             
-    except Exception as e:
-        logger.error(f"Failed to start kernel: {e}")
-        if kernel_wrapper is not None:
-            try:
-                await kernel_wrapper.cleanup()
-            except Exception as cleanup_error:
-                logger.error(f"Cleanup failed: {cleanup_error}")
-        kernel_wrapper = None
-        raise HTTPException(
-            status_code=500,
-            detail=create_error_response(
-                f"Failed to start kernel: {str(e)}",
-                "KERNEL_START_FAILED"
-            )
-        )
+            if not reply or reply.get('content', {}).get('status') != 'complete':
+                indent = reply.get('content', {}).get('indent', '')
+                raise RuntimeError(f"Incomplete code: {indent or 'Missing closing brackets'}")
+        except queue.Empty:
+            logger.warning("Timeout checking code completeness")
+        except Exception as e:
+            logger.warning(f"Code check failed: {e}")
 
-@router.post("/kernel/execute")
-async def execute_code(
-    request: CodeRequest,
-    timeout: int = 30,
-    kernel: KernelWrapper = Depends(get_kernel_wrapper)
-):
-    """Execute code in the kernel"""
-    global kernel_stats
-    
-    try:
-        if not request.code or not request.code.strip():
-            raise HTTPException(
-                status_code=400,
-                detail=create_error_response("Code cannot be empty", "INVALID_CODE")
-            )
-        
-        response = await kernel.execute_code(request.code, timeout=timeout)
-        kernel_stats["total_executions"] += 1
-        return response
-            
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error during code execution: {e}")
-        kernel_stats["failed_executions"] += 1
-        raise HTTPException(
-            status_code=500,
-            detail=create_error_response(
-                f"Unexpected execution error: {str(e)}",
-                "EXECUTION_FAILED"
-            )
-        )
+    def _check_completeness_sync(self, code: str) -> dict:
+        """Synchronous completeness check"""
+        self.kernel_manager.client.shell_channel.send_control('is_complete_request', {'code': code})
+        return self.kernel_manager.client.shell_channel.get_msg(timeout=2.0)
 
-@router.post("/kernel/install-packages")
-async def install_packages(
-    request: PackageInstallRequest,
-    kernel: KernelWrapper = Depends(get_kernel_wrapper),
-    background_tasks: BackgroundTasks = BackgroundTasks()
-):
-    """Streaming package installation endpoint"""
-    logger.info(f"Starting package installation for {request.packages}")
-    
-    # Convert single package to list if needed
-    packages = [request.packages] if isinstance(request.packages, str) else request.packages
-
-    # Validate package list
-    if not packages or not all(isinstance(pkg, str) and pkg.strip() for pkg in packages):
-        logger.error("Invalid package list provided")
-        raise HTTPException(
-            status_code=400,
-            detail=create_error_response("Invalid package list", "INVALID_PACKAGE_LIST")
-        )
-
-    # Schedule cleanup
-    background_tasks.add_task(background_kernel_cleanup, kernel)
-    
-    async def generate_stream():
-        """Generator function for streaming output"""
-        success_count = 0
-        failed_count = 0
+    async def _stream_output(self, msg_id: str, timeout: int) -> AsyncGenerator[str, None]:
+        """Async generator for streaming output"""
+        start_time = time.time()
         
         try:
-            for pkg in packages:
-                install_cmd = f"!pip install {pkg} --upgrade" if request.upgrade else f"!pip install {pkg}"
-                yield f"\nInstalling {pkg}...\n"
-                
-                # Get the streaming response
-                response = await kernel.execute_code(install_cmd, timeout=request.timeout)
-                
-                # Handle both StreamingResponse and direct string responses
-                if isinstance(response, StreamingResponse):
-                    try:
-                        async for chunk in response.body_iterator:
-                            # Handle both bytes and string chunks
-                            if isinstance(chunk, bytes):
-                                chunk_str = chunk.decode('utf-8')
-                            else:
-                                chunk_str = str(chunk)
-                            
-                            yield chunk_str
-                            
-                            # Track installation status
-                            if "Successfully installed" in chunk_str:
-                                success_count += 1
-                            elif "ERROR:" in chunk_str or "Failed" in chunk_str:
-                                failed_count += 1
-                    except Exception as e:
-                        logger.error(f"Error streaming package {pkg}: {e}")
-                        failed_count += 1
-                        yield f"\n[ERROR] Failed to install {pkg}: {str(e)}\n"
-                else:
-                    # Handle non-streaming response
-                    response_str = str(response)
-                    yield response_str
-                    if "Successfully installed" in response_str:
-                        success_count += 1
-                    elif "ERROR:" in response_str or "Failed" in response_str:
-                        failed_count += 1
-            
-            yield f"\nInstallation complete. Success: {success_count}, Failed: {failed_count}\n"
-            
+            while not self._shutdown_event.is_set():
+                if (time.time() - start_time) > timeout:
+                    yield f"\n[Execution timed out after {timeout} seconds]\n"
+                    self.execution_tracker._update_execution_state(msg_id, ExecutionState.TIMEOUT)
+                    break
+
+                msg = await self._get_iopub_message()
+                if msg is None:
+                    await asyncio.sleep(0.05)
+                    continue
+
+                # Process and yield output
+                processed = self.output_manager.process_message(msg, msg_id)
+                if processed:
+                    yield processed
+                    
         except Exception as e:
-            logger.error(f"Streaming installation failed: {e}")
-            yield f"\n[ERROR] Installation failed: {str(e)}\n"
-            # Don't raise HTTPException here since we're in a streaming response
-            # The error will be visible in the stream
+            logger.error(f"Streaming error: {e}")
+            yield f"\n[Streaming error: {str(e)}]\n"
+        finally:
+            self.execution_tracker._finalize_execution(msg_id)
 
-    return StreamingResponse(
-        generate_stream(),
-        media_type="text/plain",
-        headers={
-            "X-Package-Install": "in-progress",
-            "X-Packages": ",".join(packages)
-        }
-    )
+    async def _get_iopub_message(self) -> Optional[dict]:
+        """Get message with minimal delay"""
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                self._executor,
+                lambda: self.kernel_manager.client.get_iopub_msg(timeout=0.1)  # Reduced timeout
+            )
+        except (queue.Empty, asyncio.TimeoutError):
+            return None
+        except Exception as e:
+            logger.debug(f"Message error: {e}")
+            return None
 
-@router.post("/kernel/restart")
-async def restart_kernel(
-    background_tasks: BackgroundTasks,
-    kernel: KernelWrapper = Depends(get_kernel_wrapper)
-):
-    """Triggers a non-blocking kernel restart"""
-    if not restart_lock.acquire(blocking=False):
-        raise HTTPException(
-            status_code=409,
-            detail=create_error_response("Kernel restart already in progress.", "RESTART_IN_PROGRESS")
-        )
-    
-    try:
-        background_tasks.add_task(kernel.perform_restart, lock=restart_lock)
-        return JSONResponse(
-            status_code=202,
-            content=create_success_response("Kernel restart has been initiated.")
-        )
-    except Exception as e:
-        restart_lock.release()
-        logger.error(f"Failed to initiate kernel restart: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=create_error_response(f"Failed to initiate restart: {str(e)}", "RESTART_INITIATION_FAILED")
-        )
+    async def _handle_timeout(self, msg_id: str, timeout: int):
+        """Handle execution timeout properly"""
+        logger.warning(f"Timeout for {msg_id} after {timeout}s")
+        try:
+            # Use kernel manager's interrupt method
+            await asyncio.get_running_loop().run_in_executor(
+                self._executor,
+                self.kernel_manager.interrupt_kernel()
+            )
+        except Exception as e:
+            logger.error(f"Interrupt failed: {e}")
+        yield f"\n[Execution timed out after {timeout} seconds]\n"
+        self.execution_tracker._update_execution_state(msg_id, ExecutionState.TIMEOUT)
 
-@router.post("/kernel/shutdown")
-async def shutdown_kernel(background_tasks: BackgroundTasks):
-    """Shutdown the kernel"""
-    global kernel_wrapper
-    
-    if kernel_wrapper is None:
-        return create_success_response("No active kernel to shutdown")
-    
-    try:
-        background_tasks.add_task(async_shutdown_sequence, kernel_wrapper)
-        kernel_wrapper = None
-        return create_success_response("Shutdown initiated")
+    def _is_simple_statement(self, code: str) -> bool:
+        """Check if code is simple"""
+        patterns = [
+            r'^\s*print\(.*\)\s*$',
+            r'^\s*[\w]+\s*=\s*.+\s*$',
+            r'^\s*import\s+.+\s*$',
+            r'^\s*from\s+.+\s*import\s+.+\s*$'
+        ]
+        return any(re.match(p, code) for p in patterns)
+
+    def _is_long_running(self, code: str) -> bool:
+        """Check for long-running patterns"""
+        try:
+            tree = ast.parse(code)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.While, ast.For, ast.ListComp, ast.SetComp, ast.DictComp)):
+                    return True
+                if isinstance(node, ast.Call) and (
+                    (isinstance(node.func, ast.Name) and node.func.id in ['sleep', 'wait']) or
+                    (isinstance(node.func, ast.Attribute) and node.func.attr in ['sleep', 'wait'])
+                ):
+                    return True
+        except Exception:
+            return False
         
-    except Exception as e:
-        logger.error(f"Shutdown initiation failed: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=create_error_response(f"Shutdown failed: {str(e)}", "SHUTDOWN_FAILED")
-        )
+        keywords = ['time.sleep', 'asyncio.sleep', 'threading.', 'subprocess.']
+        return any(k in code for k in keywords)
 
-async def async_shutdown_sequence(wrapper: KernelWrapper):
-    """Orderly shutdown sequence"""
-    try:
-        await asyncio.wait_for(
-            asyncio.to_thread(wrapper.kernel_manager.shutdown_kernel),
-            timeout=30
-        )
-        await background_kernel_cleanup(wrapper)
-    except asyncio.TimeoutError:
-        logger.warning("Graceful shutdown timed out, forcing cleanup")
-        await background_kernel_cleanup(wrapper, force=True)
-    except Exception as e:
-        logger.error(f"Shutdown error: {e}")
-        await background_kernel_cleanup(wrapper, force=True)
+    async def _generate_output(self, msg_id: str, timeout: int) -> AsyncGenerator[str, None]:
+        """Generate output chunks for streaming"""
+        start_time = time.time()
+        received_idle = False
+        
+        try:
+            while not self._shutdown_event.is_set() and not received_idle:
+                # Safety timeout check
+                if time.time() - start_time > timeout:
+                    yield f"\n[Execution timed out after {timeout} seconds]\n"
+                    self.execution_tracker._update_execution_state(msg_id, ExecutionState.TIMEOUT)
+                    break
 
-@router.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    global kernel_wrapper, kernel_stats
+                msg = await self._get_iopub_message()
+                if msg is None:
+                    await asyncio.sleep(0.05)
+                    continue
+
+                # Check for idle status message (execution complete)
+                if (msg.get('header', {}).get('msg_type') == 'status' and 
+                    msg.get('content', {}).get('execution_state') == 'idle'):
+                    received_idle = True
+                    continue
+
+                # Process and yield output
+                processed = self.output_manager.process_message(msg, msg_id)
+                if processed:
+                    yield processed
+                    
+        except Exception as e:
+            logger.error(f"Streaming error: {e}")
+            yield f"\n[Streaming error: {str(e)}]\n"
+        finally:
+            self.execution_tracker._finalize_execution(msg_id)
+
+    async def _cleanup_executions(self, execution_tracker: ExecutionTracker = None):
+        """Thread-safe execution cleanup"""
+        try:
+            logger.info("Starting execution cleanup")
+            
+            # 1. Interrupt kernel if alive
+            if self.kernel_manager.is_kernel_alive():
+                try:
+                    self.kernel_manager.interrupt_kernel()
+                except Exception as e:
+                    logger.warning(f"Interrupt attempt failed: {str(e)}")
+
+            # 2. Flush kernel channels
+            self.kernel_manager.flush_channels()
+
+            # 3. Clean execution tracker
+            with self.execution_tracker._lock:
+                self.execution_tracker._executions.clear()
+                self.execution_tracker._output_buffers.clear()
+
+            logger.info("Execution cleanup completed")
+        except Exception as e:
+            logger.error(f"Cleanup error: {str(e)}")
+            raise
     
-    try:
-        is_alive = kernel_wrapper.is_kernel_alive() if kernel_wrapper else False
-        return create_success_response(
-            "System healthy",
-            {
-                "kernel_initialized": kernel_wrapper is not None,
-                "kernel_running": is_alive,
-                "session_stats": kernel_stats,
-                **({"wrapper_stats": kernel_wrapper.get_stats()} if kernel_wrapper else {})
-            }
-        )
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return create_error_response(
-            f"Health check failed: {str(e)}",
-            "HEALTH_CHECK_FAILED"
-        )
+    async def _verify_kernel_ready(self, timeout: int = 10) -> bool:
+        """Verify kernel is ready to accept commands"""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                # Try a simple kernel info request
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.client.kernel_info()
+                )
+                return True
+            except Exception:
+                await asyncio.sleep(0.5)
+        return False
+
+    async def _start_channels_with_timeout(self, timeout: int):
+        """Start channels with timeout handling"""
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    self.client.start_channels
+                )
+                
+                # Verify channels are alive
+                if all(channel.is_alive() for channel in [
+                    self.client.shell_channel,
+                    self.client.iopub_channel
+                ]):
+                    return
+                    
+                await asyncio.sleep(0.5)
+            except Exception as e:
+                logger.warning(f"Channel start attempt failed: {e}")
+                await asyncio.sleep(0.5)
+        
+        raise RuntimeError("Failed to start channels within timeout")

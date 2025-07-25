@@ -2,8 +2,8 @@
 # TODO: Update HTTPException correctly
 from fastapi import APIRouter, HTTPException, Depends, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
-from internal.kernel_wrapper import KernelWrapper
-from internal.models import CodeRequest, CodeCompleteRequest, PackageInstallRequest
+from .kernel_wrapper import KernelWrapper
+from .models import CodeRequest, CodeCompleteRequest, PackageInstallRequest
 from typing import Optional, Dict, Any, Union, List
 import logging
 import time

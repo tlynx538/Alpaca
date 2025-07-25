@@ -2,14 +2,14 @@
 import logging
 import time
 import threading
-from kernel.kernel_manage import Kernel
+from typing import Any 
 
 # Setup logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class KernelHealthMonitor:
-    def __init__(self, kernel_manager: Kernel, check_interval: int = 10, shutdown_event: threading.Event = None):
+    def __init__(self, kernel_manager: Any, check_interval: int = 10, shutdown_event: threading.Event = None):
         """Initialize KernelHealthMonitor with kernel manager and check interval.
         
         Args:
