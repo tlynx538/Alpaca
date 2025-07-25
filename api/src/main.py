@@ -7,6 +7,7 @@ origins = [
     "*",
 ]
 
+
 app = FastAPI()
 
 app.add_middleware(
@@ -16,6 +17,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# @app.on_event("startup")
+# async def startup_event():
+#     asyncio.create_task(monitor_kernel_health())
 
 @app.get("/")
 def home():
